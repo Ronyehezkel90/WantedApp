@@ -1,51 +1,40 @@
 package com.ronyehezkel.wantedapp
 
 import android.Manifest
-import android.content.ContentValues
-import android.content.Context
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Bitmap.createScaledBitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.ImageDecoder
+import android.graphics.Matrix
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.StrictMode
+import android.os.StrictMode.VmPolicy
 import android.provider.MediaStore
-import android.util.Log
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.Recorder
-import androidx.camera.video.Recording
-import androidx.camera.video.VideoCapture
 import androidx.core.content.ContextCompat
+import androidx.exifinterface.media.ExifInterface
 import com.ronyehezkel.wantedapp.databinding.ActivityMainBinding
 import java.io.File
-import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 
-typealias LumaListener = (luma: Double) -> Unit
-
 class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
-
-    private var imageCapture: ImageCapture? = null
-
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var recording: Recording? = null
-
     private lateinit var cameraExecutor: ExecutorService
+    private lateinit var imagePath: String
+    private lateinit var cameraBitmap: Bitmap
+
 
     private val activityResultLauncher =
         registerForActivityResult(
@@ -64,14 +53,53 @@ class MainActivity : AppCompatActivity() {
                     "Permission request denied",
                     Toast.LENGTH_SHORT
                 ).show()
-            } else {
-                startCamera()
             }
         }
 
     private fun requestPermissions() {
         activityResultLauncher.launch(REQUIRED_PERMISSIONS)
+
     }
+
+    fun rotateImage(source: Bitmap, angle: Float): Bitmap {
+        val matrix = Matrix()
+        matrix.postRotate(angle)
+        return Bitmap.createBitmap(
+            source, 0, 0, source.width, source.height,
+            matrix, true
+        )
+    }
+
+    private fun rotateIfNeeded(cameraBitmap: Bitmap): Bitmap {
+        val ei = ExifInterface(imagePath)
+        val orientation: Int = ei.getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_UNDEFINED
+        )
+        return when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 ->
+                rotateImage(cameraBitmap, 90f)
+            ExifInterface.ORIENTATION_ROTATE_180 ->
+                rotateImage(cameraBitmap, 180f)
+            ExifInterface.ORIENTATION_ROTATE_270 ->
+                rotateImage(cameraBitmap, 270f)
+            ExifInterface.ORIENTATION_NORMAL -> cameraBitmap
+            else -> cameraBitmap
+        }
+    }
+
+    // Get your image
+    private val resultLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val imgFile = File(imagePath)
+                if (imgFile.exists()) {
+                    cameraBitmap = BitmapFactory.decodeFile(imgFile.absolutePath)
+//                        cameraBitmap = rotateIfNeeded(cameraBitmap)
+                    viewBinding.thumbnailImageView.setImageBitmap(cameraBitmap)
+                }
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,126 +107,48 @@ class MainActivity : AppCompatActivity() {
         setContentView(viewBinding.root)
 
         // Request camera permissions
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
+        if (!allPermissionsGranted()) {
             requestPermissions()
         }
 
-        // Set up the listeners for take photo and video capture buttons
-        viewBinding.imageCaptureButton.setOnClickListener { takePhoto() }
+//        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+//            if (Environment.isExternalStorageManager()) {
+//                //todo when permission is granted
+//            } else {
+//                //request for the permission
+//                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+//                val uri = Uri.fromParts("package", packageName, null)
+//                intent.data = uri
+//                startActivity(intent)
+//            }
+//        }
+        val builder = VmPolicy.Builder()
+        StrictMode.setVmPolicy(builder.build())
 
+        // Set up the listeners for take photo and video capture buttons
+        viewBinding.thumbnailImageView.setOnClickListener {
+            val timeStamp: String = SimpleDateFormat("yyyyMMdd_HHmmss").format(Date())
+            val imageFileName = "$timeStamp.jpg"
+//            val storageDir: File = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+            val storageDir: File = externalCacheDir!!
+            imagePath = storageDir.absolutePath.toString() + "/" + imageFileName
+            val file = File(imagePath)
+            val outputFileUri: Uri = Uri.fromFile(file)
+            // Open camera
+            val cameraIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+            cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, outputFileUri)
+            resultLauncher.launch(cameraIntent)
+        }
+
+        val activity = this
+        viewBinding.print.setOnClickListener {
+            Thread().run {
+                Printer().print(cameraBitmap, activity, viewBinding.thumbnailImageView)
+            }
+        }
         cameraExecutor = Executors.newSingleThreadExecutor()
     }
 
-    private fun takePhoto() {
-        // Get a stable reference of the modifiable image capture use case
-        val imageCapture = imageCapture ?: return
-
-        // Create time stamped name and MediaStore entry.
-        val name = SimpleDateFormat(FILENAME_FORMAT, Locale.US)
-            .format(System.currentTimeMillis())
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/CameraX-Image")
-            }
-        }
-
-        // Create output options object which contains file + metadata
-        val outputOptions = ImageCapture.OutputFileOptions
-            .Builder(
-                contentResolver,
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                contentValues
-            )
-            .build()
-
-        // Set up image capture listener, which is triggered after photo has
-        // been taken
-        imageCapture.takePicture(
-            outputOptions,
-            ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onError(exc: ImageCaptureException) {
-                    Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
-                }
-
-                override fun
-                        onImageSaved(output: ImageCapture.OutputFileResults) {
-                    val msg = "Photo capture succeeded: ${output.savedUri}"
-                    Toast.makeText(baseContext, msg, Toast.LENGTH_SHORT).show()
-                    Log.d(TAG, msg)
-                    val face = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, output.savedUri!!))
-                    } else {
-                        MediaStore.Images.Media.getBitmap(contentResolver, output.savedUri)
-                    }
-
-                    val bmp = Bitmap.createBitmap(face.width, face.height, Bitmap.Config.ARGB_8888)
-                    val imageBitmap = face.copy(Bitmap.Config.ARGB_8888, true);
-                    val comboImage = Canvas(bmp)
-                    comboImage.drawBitmap(imageBitmap, 0f, 0f, null)
-
-
-
-                    val jail = BitmapFactory.decodeResource(resources, R.drawable.jail)
-                    val scaledJale = createScaledBitmap(jail, face.width, face.height, true)
-
-                    comboImage.drawBitmap(scaledJale, 0f, 0f, null)
-                    try {
-                        val directory = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
-                        val file = File(directory, "MyFile.png")
-
-                        val fileOutputStream = FileOutputStream(file)
-                        bmp.compress(Bitmap.CompressFormat.PNG, 100, fileOutputStream)
-                        fileOutputStream.close()
-                    } catch (e: java.lang.Exception) {
-                        e.printStackTrace()
-                    }
-
-                }
-            }
-        )
-    }
-
-    private fun captureVideo() {}
-
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-
-        cameraProviderFuture.addListener({
-            // Used to bind the lifecycle of cameras to the lifecycle owner
-            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
-
-            // Preview
-            val preview = Preview.Builder()
-                .build()
-                .also {
-                    it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
-                }
-
-            imageCapture = ImageCapture.Builder().build()
-
-            // Select back camera as a default
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-
-            try {
-                // Unbind use cases before rebinding
-                cameraProvider.unbindAll()
-
-                // Bind use cases to camera
-                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageCapture)
-
-            } catch (exc: Exception) {
-                Log.e(TAG, "Use case binding failed", exc)
-            }
-
-        }, ContextCompat.getMainExecutor(this))
-
-
-    }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(
